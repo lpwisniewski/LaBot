@@ -12,7 +12,6 @@ logger = logging.getLogger("labot")
 # include path to labot
 sys.path.append(Path(__file__).absolute().parents[1].as_posix())
 
-from labot import protocol
 from labot.data import Msg
 
 parser = argparse.ArgumentParser(

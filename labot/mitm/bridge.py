@@ -8,14 +8,18 @@ The classes inheriting from MsgBridgeHandler must
 implement `handle_message`.
 """
 
+import requests
+import psycopg2
 import select
 from abc import ABC, abstractmethod
 from collections import deque
-import os
+from random import randrange
 import logging
+import threading
+from threading import Thread
 import time
 
-from ..data import Buffer, Msg, Dumper
+from ..data import Buffer, Msg
 from .. import protocol
 
 logger = logging.getLogger("labot")
@@ -36,7 +40,7 @@ def direction(origin):
 class BridgeHandler(ABC):
     """Abstract class for bridging policies.
     You just have to subclass and fill the handle method.
-    
+
     It implements the proxy_callback that will be called
     when a client tries to connect to the server.
     proxy_callback will call `handle` on every packet.
@@ -110,8 +114,8 @@ class MsgBridgeHandler(DummyBridgeHandler, ABC):
     """
     Advanced policy to work with the parsed messages
     instead of the raw packets like BridgeHandler.
-    
-    This class implements a generic `handle` that calls 
+
+    This class implements a generic `handle` that calls
     `handle_message` which acts on the parsed messages
     and that should be implemented by the subclasses.
     """
@@ -132,8 +136,8 @@ class MsgBridgeHandler(DummyBridgeHandler, ABC):
             parsedMsg = protocol.read(msgType, msg.data)
 
             assert msg.data.remaining() == 0, (
-                "All content of %s have not been read into %s:\n %s"
-                % (msgType, parsedMsg, msg.data)
+                    "All content of %s have not been read into %s:\n %s"
+                    % (msgType, parsedMsg, msg.data)
             )
 
             self.handle_message(parsedMsg, origin)
@@ -163,6 +167,7 @@ class InjectorBridgeHandler(BridgeHandler):
         self.injected_to_client = 0
         self.injected_to_server = 0
         self.counter = 0
+        self.countLock = threading.Lock()
         self.db = deque([], maxlen=db_size)
         self.dumper = dumper
 
@@ -174,7 +179,9 @@ class InjectorBridgeHandler(BridgeHandler):
 
     def send_to_server(self, data):
         if isinstance(data, Msg):
+            self.countLock.acquire()
             data.count = self.counter + 1
+            self.countLock.release()
             data = data.bytes()
         self.injected_to_server += 1
         self.coSer.sendall(data)
@@ -182,6 +189,17 @@ class InjectorBridgeHandler(BridgeHandler):
     def send_message(self, s):
         msg = Msg.from_json(
             {"__type__": "ChatClientMultiMessage", "content": s, "channel": 0}
+        )
+        self.send_to_server(msg)
+
+    def send_price_request(self, item_id):
+        msg = Msg.from_json(
+            {"__type__": "ExchangeBidHouseSearchMessage", "objectGID": item_id, "follow": True}
+        )
+        self.send_to_server(msg)
+        time.sleep(randrange(5))
+        msg = Msg.from_json(
+            {"__type__": "ExchangeBidHouseSearchMessage", "objectGID": item_id, "follow": False}
         )
         self.send_to_server(msg)
 
@@ -194,10 +212,16 @@ class InjectorBridgeHandler(BridgeHandler):
         while msg is not None:
             msgType = protocol.msg_from_id[msg.id]
             parsedMsg = protocol.read(msgType, msg.data)
+            writtenMsg = None
+            try:
+                writtenMsg = Msg.from_json(parsedMsg, 0, False)
+            except:
+                pass
+
 
             assert msg.data.remaining() in [0, 48], (
-                "All content of %s have not been read into %s:\n %s"
-                % (msgType, parsedMsg, msg.data)
+                    "All content of %s have not been read into %s:\n %s"
+                    % (msgType, parsedMsg, msg.data)
             )
 
             if from_client:
@@ -209,6 +233,11 @@ class InjectorBridgeHandler(BridgeHandler):
                         size=len(msg.data),
                     ),
                 )
+                if parsedMsg["__type__"] != "BasicPingMessage":
+                    print("Sent:", parsedMsg)
+                    print("Sent Raw:", msg)
+                    print("Sent Written:", writtenMsg)
+                    print("Sent Type:", msgType)
             else:
                 logger.debug(
                     ("<- %(name)s (%(size)i Bytes)"),
@@ -216,9 +245,13 @@ class InjectorBridgeHandler(BridgeHandler):
                 )
             if from_client:
                 msg.count += self.injected_to_server - self.injected_to_client
+                self.countLock.acquire()
                 self.counter = msg.count
+                self.countLock.release()
             else:
+                self.countLock.acquire()
                 self.counter += 1
+                self.countLock.release()
             self.db.append(msg)
             if self.dumper is not None:
                 self.dumper.dump(msg)
@@ -228,6 +261,45 @@ class InjectorBridgeHandler(BridgeHandler):
             msg = Msg.fromRaw(self.buf[origin], from_client)
 
             time.sleep(0.005)
+    def show_message(self, m):
+        list = ["GameRole", "Chat", "Interactive", "GameMap", "Map", "Basic", "GameContext", "Guild", "SetCharacter"]
+        for el in list:
+            if el in m:
+                return False
+        return True
 
     def handle_message(self, m, o):
+        if m["__type__"] == "InteractiveUseRequestMessage":
+            worker = Worker(self)
+            worker.start()
+        if self.show_message(m["__type__"]):
+            print("Received:", m)
+        if m["__type__"] == "ExchangeTypesItemsExchangerDescriptionForUserMessage":
+            price1 = m["itemTypeDescriptions"][0]["prices"][0]
+            price10 = m["itemTypeDescriptions"][0]["prices"][1]
+            price100 = m["itemTypeDescriptions"][0]["prices"][2]
+            requests.post("http://localhost:3000/dofus/price",
+                          json={'itemId': m["objectGID"], 'price1': price1, 'price10': price10, 'price100': price100}
+                          )
         pass
+
+class Worker(Thread):
+    def __init__(self, bridge):
+        Thread.__init__(self)
+        self.bridge = bridge
+        self.connection = psycopg2.connect(host="localhost", database="postgres", user="postgres", password="postgrespw")
+
+    def run(self):
+        while True:
+            items = self.getItems()
+            print(items)
+            for item in items:
+                self.bridge.send_price_request(item[0])
+                time.sleep(randrange(5))
+            time.sleep(randrange(5))
+    def getItems(self):
+        cursor = self.connection.cursor()
+        cursor.execute("SELECT * FROM item WHERE selected=true;")
+        data = cursor.fetchall()
+        cursor.close()
+        return data

@@ -25,7 +25,7 @@ def launch_dofus():
     elif platform == "win32":
         appdata = os.getenv("appdata")
         parent = os.path.dirname(appdata)
-        path = parent + "\\Local\\Ankama\\zaap\\dofus\\Dofus.exe"
+        path = parent + "\\Local\\Ankama\\Dofus\\Dofus.exe"
     else:
         assert False, (
             "Your platform (%s) doesn't support automated launch yet" % sys.platform
